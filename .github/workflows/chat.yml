@@ -1,0 +1,212 @@
+name: Chat
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  models: read
+  issues: write
+
+jobs:
+  ai:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close Issue If Not Owner
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const issueCreator = context.payload.issue.user.login;
+            if (issueCreator !== owner) {
+              github.issues.update({
+                ...context.repo,
+                issue_number: context.issue.number,
+                state: 'closed'
+              });
+              github.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: `Sorry, only the owner @${owner} can create issues in this repository.`
+              });
+            }
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create model labels
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            // Skip if not requested
+            if (context.eventName !== 'issue_comment' || !context.payload.comment.body.toLowerCase().includes('update labels')) {
+              console.log('Skipping non-label update comment');
+              return;
+            }
+
+            // Get available models from catalog
+            const catalogResponse = await fetch('https://models.github.ai/catalog/models', {
+              headers: {
+                'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+              }
+            });
+
+            if (!catalogResponse.ok) {
+              throw new Error(`Failed to fetch model catalog: ${catalogResponse.status}`);
+            }
+
+            const catalog = await catalogResponse.json();
+            const availableModels = catalog.map(model => model.id);
+
+            // Get existing labels
+            const { data: existingLabels } = await github.rest.issues.listLabelsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+
+            const existingLabelNames = existingLabels.map(label => label.name);
+
+            // Create missing labels
+            for (const model of availableModels) {
+              if (!existingLabelNames.includes(model)) {
+                console.log(`Creating label for model: ${model}`);
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: model,
+                  color: '0366d6', // GitHub blue
+                  description: `Use the ${model} model for this conversation`
+                });
+              }
+            }
+
+            // Comment to confirm labels were updated
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ Updated model labels. Available models: ${availableModels.join(', ')}`
+            });
+
+      - name: Process and respond
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            // Skip if this is a GitHub Actions bot comment
+            if (context.eventName === 'issue_comment' && context.payload.comment.user.login === 'github-actions[bot]') {
+              console.log('Skipping GitHub Actions bot comment');
+              return;
+            }
+
+            const fs = require('fs');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const messages = [];
+
+            const systemPrompt = fs.readFileSync('system-prompt.md', 'utf8');
+            messages.push({
+              role: 'system',
+              content: systemPrompt
+            });
+
+            messages.push({
+              role: 'user',
+              content: context.payload.issue.title
+            });
+
+            for (const comment of comments) {
+              if (comment.user.login === 'github-actions[bot]') {
+                messages.push({
+                  role: 'assistant',
+                  content: comment.body
+                });
+              } else {
+                messages.push({
+                  role: 'user',
+                  content: comment.body
+                });
+              }
+            }
+
+            // Get available models from catalog
+            const catalogResponse = await fetch('https://models.github.ai/catalog/models', {
+              headers: {
+                'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+              }
+            });
+
+            if (!catalogResponse.ok) {
+              throw new Error(`Failed to fetch model catalog: ${catalogResponse.status}`);
+            }
+
+            const catalog = await catalogResponse.json();
+            const availableModels = catalog.map(model => model.id);
+
+            // Determine which model to use based on labels
+            const defaultModel = 'openai/gpt-4.1';
+            const modelLabel = context.payload.issue.labels.find(label => availableModels.includes(label.name));
+            const requestedModel = modelLabel ? modelLabel.name : defaultModel;
+
+            // Add default model label if no model label is present
+            if (!modelLabel) {
+              console.log(`Adding default model label: ${defaultModel}`);
+              await github.rest.issues.addLabels({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: [defaultModel]
+              });
+            }
+
+            console.log(`Using model: ${requestedModel}`);
+
+            try {
+              const response = await fetch('https://models.github.ai/inference/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+                },
+                body: JSON.stringify({
+                  messages,
+                  model: requestedModel
+                })
+              });
+              
+              if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`API request failed: ${response.status} ${errorText}`);
+              }
+              
+              const data = await response.json();
+              const aiResponse = data.choices[0].message.content;
+              
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: aiResponse
+              });
+            } catch (error) {
+              console.error('Error:', error);
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `Sorry, I encountered an error: ${error.message}`
+              });
+            }
+
+      - name: Color all labels
+        uses: AnandChowdhary/color-labels-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
