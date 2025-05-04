@@ -1,0 +1,501 @@
+# .github/workflows/ai-assistant.yml
+name: AI Assistant (Pollinations.ai)
+
+on:
+  issue_comment:
+    types: [created] # Trigger only on new comments
+
+permissions:
+  # Required for reading/writing issues and comments
+  issues: write
+  # Required for adding reactions to comments
+  reactions: write
+  # Required for checking out code, reading files, committing changes
+  contents: write
+  # Required for creating pull requests
+  pull-requests: write
+
+jobs:
+  ai_assistant_job:
+    runs-on: ubuntu-latest
+    # Prevent recursive loops if the bot mentions itself or replies to its own comments
+    if: github.event.sender.type != 'Bot'
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        # Fetch history needed for creating branches/PRs correctly
+        with:
+          fetch-depth: 0
+
+      - name: Run AI Assistant Logic
+        uses: actions/github-script@v7
+        id: assistant # Give this step an ID to access its outputs if needed later
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- Pollinations.ai Specific Configuration ---
+          # NO API KEY NEEDED per documentation
+          POLLINATIONS_API_ENDPOINT: 'https://text.pollinations.ai/openai' # Use the OpenAI compatible POST endpoint
+          POLLINATIONS_MODEL: 'openai' # Default model to use (can be changed, e.g., 'mistral', check /models)
+          # --- Bot Configuration ---
+          BOT_USERNAME: '@FreyaAI' # <-- VERY IMPORTANT: CHANGE THIS to your bot's actual handle
+          BOT_EMAIL: 'dovox42841@idoidraw.com' # <-- CHANGE THIS or use a real email if preferred
+          BOT_REFERRER: 'GitHubActionBot/${{ github.repository }}' # Optional: Identify your bot to Pollinations
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { execSync } = require('child_process'); // For running git commands
+
+            // --- Configuration ---
+            const botUsername = process.env.BOT_USERNAME;
+            // No API Key needed for Pollinations basic text/POST endpoint
+            const apiEndpoint = process.env.POLLINATIONS_API_ENDPOINT;
+            const modelName = process.env.POLLINATIONS_MODEL || 'openai'; // Use specified model or default
+            const botEmail = process.env.BOT_EMAIL; // Email for commits
+            const referrer = process.env.BOT_REFERRER; // Referrer for API call
+            const systemPromptPath = 'system-prompt.md'; // Path to your system prompt file
+            const maxCodeSnippetLength = 4000; // Limit code snippet length to prevent huge prompts
+
+            // --- Context ---
+            const { payload, issue, repo } = context;
+            const commentBody = payload.comment.body;
+            const issueNumber = issue.number;
+            const commentId = payload.comment.id;
+            const commenterLogin = payload.comment.user.login;
+            const repoOwner = repo.owner;
+            const repoName = repo.repo;
+
+            // --- Helper Functions ---
+            async function postComment(body) {
+              await github.rest.issues.createComment({
+                owner: repoOwner,
+                repo: repoName,
+                issue_number: issueNumber,
+                body: body
+              });
+            }
+
+            async function addReaction(reaction = 'eyes') {
+              try {
+                await github.rest.reactions.createForIssueComment({
+                  owner: repoOwner,
+                  repo: repoName,
+                  comment_id: commentId,
+                  content: reaction
+                });
+              } catch (error) {
+                console.warn(`Could not add reaction: ${error.message}`);
+              }
+            }
+
+            function readFileContent(filePath) {
+              const fullPath = path.resolve(filePath);
+              // Basic security check: ensure the path is within the checked-out repo
+              if (!fullPath.startsWith(path.resolve('.'))) {
+                  throw new Error(`Access denied to path: ${filePath}`);
+              }
+              if (fs.existsSync(fullPath)) {
+                  const content = fs.readFileSync(fullPath, 'utf8');
+                  if (content.length > maxCodeSnippetLength) {
+                    return content.substring(0, maxCodeSnippetLength) + '\n... [truncated]';
+                  }
+                  return content;
+              } else {
+                  throw new Error(`File not found: ${filePath}`);
+              }
+            }
+
+            async function createPullRequest(branchName, title, body, changes) {
+              console.log(`Attempting to create PR: ${title} from branch ${branchName}`);
+              // Determine base branch dynamically
+              let baseBranch;
+              try {
+                  const defaultBranch = execSync('git symbolic-ref refs/remotes/origin/HEAD | sed "s@^refs/remotes/origin/@@"').toString().trim();
+                  baseBranch = defaultBranch;
+                  // If the issue originated from a PR, use that PR's base branch
+                  if (payload.issue.pull_request) {
+                     const { data: prData } = await github.rest.pulls.get({ owner: repoOwner, repo: repoName, pull_number: issueNumber });
+                     baseBranch = prData.base.ref;
+                     console.log(`Issue is associated with PR #${issueNumber}, setting base branch to '${baseBranch}'`);
+                  } else {
+                     console.log(`Issue is not a PR, using default repository branch '${baseBranch}' as base.`);
+                  }
+              } catch (e) {
+                  console.error(`Error determining base branch: ${e}. Falling back to 'main'.`);
+                  baseBranch = 'main'; // Fallback, adjust if your default is different
+              }
+              console.log(`Using base branch: ${baseBranch}`);
+
+              try {
+                // 1. Ensure we are on the base branch and it's up-to-date before branching off
+                execSync(`git checkout ${baseBranch}`);
+                execSync(`git pull origin ${baseBranch}`); // Ensure local base is updated
+                // 2. Create and switch to a new branch
+                execSync(`git checkout -b ${branchName}`);
+                console.log(`Created and checked out branch ${branchName} from ${baseBranch}`);
+
+                // 3. Apply changes (overwrite files)
+                for (const change of changes) {
+                  const filePath = change.file;
+                  const fileContent = change.content;
+                  const dir = path.dirname(filePath);
+                  if (!fs.existsSync(dir)) {
+                    fs.mkdirSync(dir, { recursive: true });
+                  }
+                  fs.writeFileSync(filePath, fileContent);
+                  console.log(`Applied changes to ${filePath}`);
+                }
+
+                // 4. Stage changes
+                execSync(`git add .`); // Add all changes made
+
+                // 5. Commit changes
+                // Configure git user for the commit
+                execSync(`git config user.name "${botUsername.substring(1) || 'github-actions[bot]'}"`); // Remove '@' if present
+                execSync(`git config user.email "${botEmail}"`);
+                const commitMessage = `AI Assistant: ${title}\n\nGenerated for issue #${issueNumber} by ${commenterLogin}`;
+                execSync(`git commit -m "${commitMessage.replace(/"/g, '\\"')}"`); // Escape quotes in commit message
+                console.log(`Committed changes`);
+
+                // 6. Push the new branch
+                execSync(`git push origin ${branchName}`);
+                console.log(`Pushed branch ${branchName} to origin`);
+
+                // 7. Create the Pull Request
+                const pr = await github.rest.pulls.create({
+                  owner: repoOwner,
+                  repo: repoName,
+                  title: `AI: ${title} (for #${issueNumber})`, // Add prefix for clarity
+                  head: branchName,
+                  base: baseBranch, // Use determined base branch
+                  body: body + `\n\nRequested by @${commenterLogin} in #${issueNumber}.\nCloses #${issueNumber}`, // Link PR to issue and mention user
+                });
+                console.log(`Created Pull Request: ${pr.data.html_url}`);
+                return pr.data.html_url;
+
+              } catch (error) {
+                console.error(`Failed to create pull request: ${error}`);
+                await postComment(`⚠️ Error creating pull request: ${error.message}\nCheck the Action logs for details.`);
+                // Attempt to clean up the failed branch
+                try {
+                   execSync(`git checkout ${baseBranch}`); // Back to base branch
+                   execSync(`git branch -D ${branchName} || true`); // Delete local branch if exists
+                   // Consider deleting remote branch if push was successful but PR creation failed
+                   // execSync(`git push origin --delete ${branchName} || true`);
+                } catch (cleanupError) {
+                   console.warn(`Error during branch cleanup: ${cleanupError.message}`);
+                }
+                return null;
+              }
+            }
+
+            async function addLabels(labels) {
+                console.log(`Adding labels: ${labels.join(', ')}`);
+                try {
+                    // Filter out any empty strings or null values
+                    const validLabels = labels.filter(label => label && typeof label === 'string' && label.trim().length > 0);
+                    if (validLabels.length === 0) {
+                        console.log("No valid labels provided to add.");
+                        return true; // Technically not an error
+                    }
+                    await github.rest.issues.addLabels({
+                        owner: repoOwner,
+                        repo: repoName,
+                        issue_number: issueNumber,
+                        labels: validLabels,
+                    });
+                    console.log('Labels added successfully.');
+                    return true;
+                } catch (error) {
+                    console.error(`Failed to add labels: ${error}`);
+                    await postComment(`⚠️ Error adding labels (${labels.join(', ')}): ${error.message}`);
+                    return false;
+                }
+            }
+
+
+            // --- Main Logic ---
+
+            // 1. Check if the bot was mentioned AND the comment is not from the bot itself
+            if (!commentBody || !commentBody.includes(botUsername) || payload.comment.user.login === botUsername.substring(1)) {
+              console.log(`Bot not mentioned, or comment is from the bot itself (${payload.comment.user.login}). Skipping.`);
+              return;
+            }
+            console.log(`Bot ${botUsername} mentioned by ${commenterLogin} in comment ${commentId}. Processing...`);
+
+            // 2. Acknowledge the mention
+            await addReaction('eyes');
+            // Don't post "Working on it" immediately if the action might take time and post its own status.
+            // Let the final result be the main comment.
+
+            // 3. Gather context for the AI
+            const issueData = await github.rest.issues.get({
+              owner: repoOwner,
+              repo: repoName,
+              issue_number: issueNumber
+            });
+            const issueTitle = issueData.data.title;
+            const issueBody = issueData.data.body || ''; // Handle empty body
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: repoOwner,
+              repo: repoName,
+              issue_number: issueNumber,
+              per_page: 100 // Get more comments if needed
+            });
+
+            // 4. Prepare messages for the AI
+            const messages = [];
+            let systemPrompt = "You are an AI assistant integrated into GitHub."; // Default prompt
+            if (fs.existsSync(systemPromptPath)) {
+                systemPrompt = fs.readFileSync(systemPromptPath, 'utf8');
+            } else {
+                console.warn(`System prompt file not found at ${systemPromptPath}. Using default.`);
+                // Add instructions to default prompt if file is missing
+                systemPrompt += "\nYou can analyze requests, read specified files, suggest code changes, create Pull Requests, and assign labels. \nTo request file content, respond ONLY with: `ACTION: READ_FILES: [\"path/to/file1.js\", \"path/to/file2.py\"]`\nTo propose a Pull Request, respond ONLY with: `ACTION: CREATE_PR: { \"branch\": \"feature/ai-suggestion\", \"title\": \"AI Suggestion for X\", \"body\": \"Description of changes...\", \"changes\": [{ \"file\": \"path/to/file.js\", \"content\": \"// New file content here...\" }] }`\nTo assign labels, respond ONLY with: `ACTION: ASSIGN_LABELS: [\"bug\", \"enhancement\"]`";
+            }
+            messages.push({ role: 'system', content: systemPrompt });
+
+            // Add issue title and body as first user message
+            messages.push({ role: 'user', content: `Issue Title: ${issueTitle}\n\nIssue Body:\n${issueBody}` });
+
+            // Add comments to the history (limit history to avoid huge prompts)
+            const maxHistoryChars = 8000; // Limit total characters in history
+            let historyChars = 0;
+            const relevantComments = comments // Process in reverse chronological order
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+              .filter(comment => {
+                   // Don't include the trigger comment itself in history sent *to* the AI
+                   if (comment.id === commentId) return false;
+                   // Simple check to filter out previous "working on it" messages if pattern exists
+                   if (comment.user.login === botUsername.substring(1) && comment.body.includes("I'm looking into that")) return false;
+                   return true;
+              });
+
+            const historyMessages = [];
+            for (const comment of relevantComments) {
+                const role = comment.user.login === botUsername.substring(1) ? 'assistant' : 'user';
+                const commentText = `Comment from @${comment.user.login}:\n${comment.body}`;
+                if (historyChars + commentText.length > maxHistoryChars) {
+                    console.log("Comment history limit reached. Truncating older comments.");
+                    break; // Stop adding older comments
+                }
+                historyMessages.push({ role: role, content: commentText });
+                historyChars += commentText.length;
+            }
+            // Add history messages in chronological order
+            messages.push(...historyMessages.reverse());
+
+            // Add the triggering comment last
+            messages.push({ role: 'user', content: `Current request from @${commenterLogin}:\n${commentBody}` });
+
+
+            // 5. Call the Pollinations AI API
+            let aiResponseContent = '';
+            let initialWorkingComment; // Store ref to temp comment
+            try {
+              initialWorkingComment = await github.rest.issues.createComment({
+                  owner: repoOwner,
+                  repo: repoName,
+                  issue_number: issueNumber,
+                  body: `Hi @${commenterLogin}, I'm analyzing your request using Pollinations.ai (\`${modelName}\`)... 🤔`
+              });
+
+              console.log(`Sending ${messages.length} messages (${historyChars} history chars) to AI: ${apiEndpoint} using model ${modelName}`);
+              // console.log("Messages being sent:", JSON.stringify(messages, null, 2)); // DEBUG: Log messages if needed
+
+              const requestBody = {
+                model: modelName,
+                messages: messages,
+                // seed: 42, // Optional: Add seed if desired
+                // max_tokens: 1000, // Optional: Limit response length
+                // temperature: 0.7, // Optional: Adjust creativity
+                private: true, // Optional: Keep requests private
+                referrer: referrer // Optional: Identify the bot
+              };
+
+              const response = await fetch(apiEndpoint, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  // No 'Authorization' header needed for this endpoint
+                },
+                body: JSON.stringify(requestBody)
+              });
+
+              if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`API request failed: ${response.status} ${response.statusText} - ${errorText}`);
+              }
+
+              const data = await response.json();
+
+              // Standard OpenAI response structure expected
+              if (!data.choices || data.choices.length === 0 || !data.choices[0].message || !data.choices[0].message.content) {
+                   throw new Error('Invalid AI response structure received from Pollinations.');
+              }
+              aiResponseContent = data.choices[0].message.content;
+              console.log("AI Response received.");
+              // console.log("Raw AI Response:", aiResponseContent); // DEBUG
+
+            } catch (error) {
+              console.error('Error calling AI API:', error);
+              const errorComment = `Sorry @${commenterLogin}, I encountered an error trying to process your request with Pollinations.ai: \n\`\`\`\n${error.message}\n\`\`\``;
+              if (initialWorkingComment) {
+                  await github.rest.issues.updateComment({ owner: repoOwner, repo: repoName, comment_id: initialWorkingComment.data.id, body: errorComment });
+              } else {
+                  await postComment(errorComment);
+              }
+              return; // Stop execution
+            }
+
+
+            // 6. Process AI response for Actions or standard reply
+            let finalCommentBody = ''; // Build the final comment to post/update
+
+            // Clean up potential markdown code fences around the ACTION if the AI wrapped it
+            aiResponseContent = aiResponseContent.trim().replace(/^```json\s*|^```\s*/, '').replace(/\s*```$/, '').trim();
+
+            // Check for READ_FILES action
+            const readFilesMatch = aiResponseContent.match(/^ACTION:\s*READ_FILES:\s*(\[.*?\])/);
+            if (readFilesMatch && readFilesMatch[1]) {
+                try {
+                    const filesToRead = JSON.parse(readFilesMatch[1]);
+                    let fileContents = '';
+                    let filesRead = [];
+                    let filesFailed = [];
+                    finalCommentBody = `Okay @${commenterLogin}, processing file request:\n`;
+
+                    for (const file of filesToRead) {
+                        try {
+                           const content = readFileContent(file);
+                           fileContents += `\n\n--- Content of ${file} ---\n${content}\n--- End of ${file} ---`;
+                           filesRead.push(file);
+                        } catch (fileError) {
+                            console.warn(`Could not read file ${file}: ${fileError.message}`);
+                            filesFailed.push(file);
+                        }
+                    }
+
+                    if (filesRead.length > 0) {
+                        finalCommentBody += `✅ Successfully read:\n\`\`\`\n${filesRead.join('\n')}\n\`\`\`\n`;
+                        // IMPORTANT: This version DOES NOT automatically re-prompt the AI with the file content.
+                        // You would need a more complex setup (e.g., another workflow trigger or manual step)
+                        // to feed this content back for analysis.
+                        finalCommentBody += `\n*Note: File content is ready for the next step (manual trigger or future enhancement needed for automatic re-analysis).*`;
+                    }
+                    if (filesFailed.length > 0) {
+                        finalCommentBody += `\n❌ Could not access:\n\`\`\`\n${filesFailed.join('\n')}\n\`\`\``;
+                    }
+
+                } catch (parseError) {
+                    console.error("Failed to parse READ_FILES action:", parseError);
+                    finalCommentBody = `⚠️ @${commenterLogin}, I tried to process a file read request but encountered an error parsing the instructions. The raw response was:\n\`\`\`\n${aiResponseContent}\n\`\`\``;
+                }
+
+            // Check for CREATE_PR action
+            } else if (aiResponseContent.startsWith('ACTION: CREATE_PR:')) {
+                 try {
+                    const prDataString = aiResponseContent.substring('ACTION: CREATE_PR:'.length).trim();
+                    const prData = JSON.parse(prDataString);
+
+                    if (!prData.branch || !prData.title || !prData.body || !prData.changes || !Array.isArray(prData.changes)) {
+                        throw new Error("Invalid CREATE_PR data structure. Missing required fields (branch, title, body, changes array).");
+                    }
+                     // Simple validation of changes structure
+                    for (const change of prData.changes) {
+                        if (typeof change.file !== 'string' || typeof change.content !== 'string') {
+                            throw new Error("Invalid structure within 'changes' array. Each item must have 'file' and 'content' strings.");
+                        }
+                    }
+
+                    // Update status before starting potentially long PR creation
+                    const prStatusComment = `Okay @${commenterLogin}, attempting to create the requested Pull Request titled "${prData.title}"... 🛠️`;
+                    if (initialWorkingComment) {
+                        await github.rest.issues.updateComment({ owner: repoOwner, repo: repoName, comment_id: initialWorkingComment.data.id, body: prStatusComment });
+                        initialWorkingComment = null; // Don't try to update it again
+                    } else {
+                       initialWorkingComment = await postComment(prStatusComment); // Post new status if needed
+                    }
+
+
+                    const prUrl = await createPullRequest(prData.branch, prData.title, prData.body, prData.changes);
+                    if (prUrl) {
+                        finalCommentBody = `✅ @${commenterLogin}, I've created the Pull Request for you: ${prUrl}`;
+                    } else {
+                        // Error comment already posted by createPullRequest function
+                        finalCommentBody = `❌ @${commenterLogin}, failed to create the Pull Request. Please see the error message above and check the Action logs.`;
+                    }
+                 } catch (parseError) {
+                    console.error("Failed to parse or validate CREATE_PR action:", parseError);
+                    finalCommentBody = `⚠️ @${commenterLogin}, I tried to process a Pull Request creation request but encountered an error: ${parseError.message}. The raw response was:\n\`\`\`json\n${aiResponseContent}\n\`\`\``;
+                 }
+
+            // Check for ASSIGN_LABELS action
+            } else if (aiResponseContent.startsWith('ACTION: ASSIGN_LABELS:')) {
+                try {
+                    const labelsDataString = aiResponseContent.substring('ACTION: ASSIGN_LABELS:'.length).trim();
+                    const labelsToAdd = JSON.parse(labelsDataString);
+
+                    if (!Array.isArray(labelsToAdd) || !labelsToAdd.every(l => typeof l === 'string')) {
+                         throw new Error("Invalid ASSIGN_LABELS data structure. Expected an array of strings.");
+                    }
+                    const validLabels = labelsToAdd.filter(label => label && label.trim().length > 0);
+
+                    if (validLabels.length > 0) {
+                        const success = await addLabels(validLabels);
+                        if (success) {
+                            finalCommentBody = `✅ @${commenterLogin}, I've added the following label(s): ${validLabels.map(l => `\`${l}\``).join(', ')}`;
+                        } else {
+                            // Error comment already posted by addLabels function
+                            finalCommentBody = `❌ @${commenterLogin}, failed to add labels. Please see the error message above and check the Action logs.`;
+                        }
+                    } else {
+                         finalCommentBody = `Okay @${commenterLogin}, the request didn't contain any valid labels to add.`;
+                    }
+                } catch (parseError) {
+                    console.error("Failed to parse ASSIGN_LABELS action:", parseError);
+                    finalCommentBody = `⚠️ @${commenterLogin}, I tried to process a label assignment request but encountered an error parsing the instructions: ${parseError.message}. The raw response was:\n\`\`\`\n${aiResponseContent}\n\`\`\``;
+                }
+
+            // Default: Post the AI response as a comment
+            } else {
+              finalCommentBody = aiResponseContent; // Use the AI's text response directly
+            }
+
+            // 7. Post the final response/result, updating the initial comment if possible
+            if (finalCommentBody) {
+                 if (initialWorkingComment && !finalCommentBody.startsWith('❌') && !finalCommentBody.startsWith('⚠️')) { // Don't overwrite if it was an error status already
+                     console.log(`Updating initial comment ${initialWorkingComment.data.id} with final response.`);
+                     await github.rest.issues.updateComment({
+                         owner: repoOwner,
+                         repo: repoName,
+                         comment_id: initialWorkingComment.data.id,
+                         body: finalCommentBody // Update the 'working on it' comment
+                     });
+                 } else {
+                     // If there was no initial comment, or if it was an error, or PR action updated it already, post a new comment.
+                     console.log("Posting final response as a new comment.");
+                     await postComment(finalCommentBody);
+                     // Delete the initial "working" comment if it still exists and we posted a *new* final comment
+                     if (initialWorkingComment) {
+                       try {
+                         await github.rest.issues.deleteComment({ owner: repoOwner, repo: repoName, comment_id: initialWorkingComment.data.id });
+                       } catch (deleteError) { console.warn(`Could not delete temporary comment ${initialWorkingComment.data.id}: ${deleteError.message}`)}
+                     }
+                 }
+            } else {
+                 console.log("No final comment body generated (e.g., action failed with specific message already posted).");
+                 // Clean up initial comment if it still exists and no final message was set
+                 if (initialWorkingComment) {
+                    try {
+                         await github.rest.issues.deleteComment({ owner: repoOwner, repo: repoName, comment_id: initialWorkingComment.data.id });
+                    } catch (deleteError) { console.warn(`Could not delete temporary comment ${initialWorkingComment.data.id}: ${deleteError.message}`)}
+                 }
+            }
